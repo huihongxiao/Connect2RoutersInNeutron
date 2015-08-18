@@ -1,0 +1,48 @@
+ext-net
+ha router
+proxy-net
+dvr
+net[1]...net[n]
+
+1. 在HA router的namespace里面增加路由，让HA router的包能够到达dvr所连接的网络。需要为每一个dvr连接的网络添加一条路由规则。
+在HA router的namespace里面执行
+ip r add <net[x] cidr> via <ip of port in proxy net, and plug to dvr> dev <qr in proxy net, and plug to ha router>
+
+考虑到ha router可能迁移，可以用下面命令来给neutron db里面增加route规则，这样能保持route，而不必反复添加
+neutron router-update public-ha-router --routes type=dict list=true destination=192.168.200.0/24,nexthop=192.168.100.5 
+neutron router-update <public router name/ID> --routes type=dict list=true destination=<private net cidr>,nexthop=<ip of port in proxy net, and plug to dvr>
+
+清除route,只有这样才能将router上的gateway清除
+neutron router-update public-ha-router --routes action=clear
+
+
+2.1 compute上 dvr的namespace里面，增加能够发送到<qr in proxy net, and plug to ha router>的flow规则，这是因为，最终是通过ha router连接到外网，实际上是proxy-net上的qr和ha router上的qg做NAT出去，所以包要先能到达qr。
+在compute上的dvr namespace里面执行
+ ovs-ofctl mod-flows br-tun "table=20,priority=2,dl_vlan=3,dl_dst=fa:16:3e:b9:c3:81,actions=strip_vlan,set_tunnel:0x3ea,output:5,6,7"
+ 
+ 其实在没有对应flow的情况下，add-flows应该也是可以的
+ 
+ 其中table=20中的20是实际处理转发的table，实际中数字可能不一样，priority要保证该规则能优先处理，正相关，dl_vlan和set_tunnel是tenant network相关的信息，可以参考已有的flow规则，dl_dst是 proxy-net在ha router里面的qr的mac地址。output要指定3个controller对应tunnel的port，因为ha router会发生迁移，实际的router可能在任意的controller上，所以干脆向三个controller（的br-tun）都发送。
+ 
+2.2 controller上这个时候已经能够收到来自compute的包了，可以用tcpdump查看eth。但是包还是到不了<qr in proxy net, and plug to ha router>。简单粗暴的方法就是在br-int上（因为br-tun接收到的包会转发给br-int）
+ovs-ofctl add-flow br-int "table=0,priority=4,in_port=4,dl_dst=fa:16:3e:b9:c3:81,actions=strip_vlan,output:45"
+其他的类似于2.1，output对应的是<qr in proxy net, and plug to ha router> 在 br-int上的port号
+
+3. 为了能让虚机连接外网，在compute上 dvr的namespace里面，增加一条default gw
+ip r add 0.0.0.0/0 via <ip of port in proxy net, and plug to ha router>  dev <qr in proxy net, and plug to dvr>
+
+
+controller
+ovs-ofctl mod-flows br-int "table=1, priority=4,dl_vlan=11,dl_dst=fa:16:3e:70:32:2a actions=strip_vlan,mod_dl_src:fa:16:3e:24:3b:71,output:19"  
+
+compute
+ip n chg 192.168.100.6 dev qr-38449bb4-bf lladdr fa:16:3e:70:32:2a nud perm
+
+需要关联floatingip的lbaas
+lbaas-namespace里面执行
+ip r add 172.17.228.0/24 via 172.17.100.5 dev tap8c18c114-90
+ip r chg <cidr of tenant network> via <ip of port in proxy net, and plug to dvr> dev <vip-port>
+在lbaas所在的node上，为proxy-net增加gateway的flow规则，原本是有一条的，但是只向一个port输出，对ha不适用
+ovs-ofctl mod-flows br-tun "table=20, priority=2,dl_vlan=9,dl_dst=fa:16:3e:9e:dd:8d actions=strip_vlan,set_tunnel:0x12c,output:5,6"
+ovs-ofctl mod-flows br-tun "table=20, priority=2,dl_vlan=<inner vlan id>,dl_dst=<proxy net gateway mac> actions=strip_vlan,set_tunnel:<proxy net tunnel id>,output:<other nodes that might have ha router>"
+要分别在ha router和lbaas的namespace里面添加vip和qr的邻接表
